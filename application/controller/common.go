@@ -29,20 +29,36 @@ func clientSupportGZIP(r *http.Request) bool {
 }
 
 var (
-	serverMessageFormatLink = regexp.MustCompile(`\[(.*?)\]\((.*?)\)`)
+	serverMessageFormatLink  = regexp.MustCompile(`\[(.*?)\]\((.*?)\)`)
+	serverMessageFormatImage = regexp.MustCompile(`!\[(.*?)\]\((.*?)\)`)
 )
 
 func parseServerMessage(input string) (result string) {
-	// Yep, this is a new low, throwing regexp at a flat text format now...will
-	// rewrite the entire thing in a new version with a proper parser, maybe
-	// Con: Barely work when we only need to support exactly one text format
-	// Pro: Expecting a debugging battle, wrote the thing in one go instead
-	found := serverMessageFormatLink.FindAllStringSubmatchIndex(input, -1)
-	if len(found) <= 0 {
-		return input
-	}
+	// Handle images first
+	foundImages := serverMessageFormatImage.FindAllStringSubmatchIndex(input, -1)
 	currentStart := 0
-	for _, f := range found {
+	for _, f := range foundImages {
+		if len(f) != 6 { // Expecting 6 parameters from the given expression
+			return input
+		}
+		segStart, segEnd, altStart, altEnd, srcStart, srcEnd :=
+			f[0], f[1], f[2], f[3], f[4], f[5]
+		result += input[currentStart:segStart]
+		result += "<img src=\"" +
+			input[srcStart:srcEnd] +
+			"\" alt=\"" +
+			input[altStart:altEnd] +
+			"\" />"
+		currentStart = segEnd
+	}
+	result += input[currentStart:]
+
+	// Handle links
+	input = result
+	result = ""
+	foundLinks := serverMessageFormatLink.FindAllStringSubmatchIndex(input, -1)
+	currentStart = 0
+	for _, f := range foundLinks {
 		if len(f) != 6 { // Expecting 6 parameters from the given expression
 			return input
 		}
