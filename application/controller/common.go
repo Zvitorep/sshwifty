@@ -48,7 +48,7 @@ func parseServerMessage(input string) (result string) {
 			input[srcStart:srcEnd] +
 			"\" alt=\"" +
 			input[altStart:altEnd] +
-			"\" />"
+			"\" style=\"display:block;width:100%\"/>"
 		currentStart = segEnd
 	}
 	result += input[currentStart:]
