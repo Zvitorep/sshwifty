@@ -18,6 +18,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -47,32 +48,41 @@ const (
 
 // Server signal codes
 const (
-	TelnetServerRemoteBand    = 0x00
-	TelnetServerDialFailed    = 0x01
-	TelnetServerDialConnected = 0x02
+	TelnetServerRemoteBand                 = 0x00
+	TelnetServerHookOutputBeforeConnecting = 0x01
+	TelnetServerDialFailed                 = 0x02
+	TelnetServerDialConnected              = 0x03
 )
 
 type telnetClient struct {
-	l          log.Logger
-	w          command.StreamResponder
-	cfg        command.Configuration
-	remoteChan chan net.Conn
-	remoteConn net.Conn
-	closeWait  sync.WaitGroup
+	l             log.Logger
+	hooks         command.Hooks
+	w             command.StreamResponder
+	cfg           command.Configuration
+	baseCtx       context.Context
+	baseCtxCancel func()
+	remoteChan    chan net.Conn
+	remoteConn    net.Conn
+	closeWait     sync.WaitGroup
 }
 
 func newTelnet(
 	l log.Logger,
+	hooks command.Hooks,
 	w command.StreamResponder,
 	cfg command.Configuration,
 ) command.FSMMachine {
+	ctx, ctxCancel := context.WithCancel(context.Background())
 	return &telnetClient{
-		l:          l,
-		w:          w,
-		cfg:        cfg,
-		remoteChan: make(chan net.Conn, 1),
-		remoteConn: nil,
-		closeWait:  sync.WaitGroup{},
+		l:             l,
+		hooks:         hooks,
+		w:             w,
+		cfg:           cfg,
+		baseCtx:       ctx,
+		baseCtxCancel: sync.OnceFunc(ctxCancel),
+		remoteChan:    make(chan net.Conn, 1),
+		remoteConn:    nil,
+		closeWait:     sync.WaitGroup{},
 	}
 }
 
@@ -80,7 +90,6 @@ func parseTelnetConfig(p configuration.Preset) (configuration.Preset, error) {
 	oldHost := p.Host
 
 	_, _, sErr := net.SplitHostPort(p.Host)
-
 	if sErr != nil {
 		p.Host = net.JoinHostPort(p.Host, telnetDefaultPortString)
 	}
@@ -96,7 +105,6 @@ func (d *telnetClient) Bootup(
 	r *rw.LimitedReader,
 	b []byte) (command.FSMState, command.FSMError) {
 	addr, addrErr := ParseAddress(r.Read, b)
-
 	if addrErr != nil {
 		return nil, command.ToFSMError(
 			addrErr, TelnetRequestErrorBadRemoteAddress)
@@ -111,31 +119,49 @@ func (d *telnetClient) Bootup(
 func (d *telnetClient) remote(addr string) {
 	defer func() {
 		d.w.Signal(command.HeaderClose)
-
 		close(d.remoteChan)
+		d.baseCtxCancel()
 		d.closeWait.Done()
 	}()
 
 	buf := [4096]byte{}
 
-	clientConn, clientConnErr := d.cfg.Dial("tcp", addr, d.cfg.DialTimeout)
-
-	if clientConnErr != nil {
-		errLen := copy(
-			buf[d.w.HeaderSize():], clientConnErr.Error()) + d.w.HeaderSize()
+	err := d.hooks.Run(
+		d.baseCtx,
+		configuration.HOOK_BEFORE_CONNECTING,
+		command.NewHookParameters(2).
+			Insert("Remote Type", "Telnet").
+			Insert("Remote Address", addr),
+		command.NewDefaultHookOutput(d.l, func(
+			b []byte,
+		) (wLen int, wErr error) {
+			wLen = len(b)
+			dLen := copy(buf[d.w.HeaderSize():], b) + d.w.HeaderSize()
+			wErr = d.w.SendManual(
+				TelnetServerHookOutputBeforeConnecting,
+				buf[:dLen],
+			)
+			return
+		}),
+	)
+	if err != nil {
+		errLen := copy(buf[d.w.HeaderSize():], err.Error()) + d.w.HeaderSize()
 		d.w.SendManual(TelnetServerDialFailed, buf[:errLen])
-
 		return
 	}
 
+	dialCtx, dialCtxCancel := context.WithTimeout(d.baseCtx, d.cfg.DialTimeout)
+	defer dialCtxCancel()
+	clientConn, err := d.cfg.Dial(dialCtx, "tcp", addr)
+	if err != nil {
+		errLen := copy(buf[d.w.HeaderSize():], err.Error()) + d.w.HeaderSize()
+		d.w.SendManual(TelnetServerDialFailed, buf[:errLen])
+		return
+	}
 	defer clientConn.Close()
 
-	clientConnErr = d.w.SendManual(
-		TelnetServerDialConnected,
-		buf[:d.w.HeaderSize()],
-	)
-
-	if clientConnErr != nil {
+	err = d.w.SendManual(TelnetServerDialConnected, buf[:d.w.HeaderSize()])
+	if err != nil {
 		return
 	}
 
@@ -148,15 +174,13 @@ func (d *telnetClient) remote(addr string) {
 	d.remoteChan <- &timeoutClientConn
 
 	for {
-		rLen, rErr := clientConn.Read(buf[d.w.HeaderSize():])
-
-		if rErr != nil {
+		rLen, err := clientConn.Read(buf[d.w.HeaderSize():])
+		if err != nil {
 			return
 		}
 
 		wErr := d.w.SendManual(
 			TelnetServerRemoteBand, buf[:rLen+d.w.HeaderSize()])
-
 		if wErr != nil {
 			return
 		}
@@ -169,11 +193,9 @@ func (d *telnetClient) getRemote() (net.Conn, error) {
 	}
 
 	remoteConn, ok := <-d.remoteChan
-
 	if !ok {
 		return nil, ErrTelnetUnableToReceiveRemoteConn
 	}
-
 	d.remoteConn = remoteConn
 
 	return d.remoteConn, nil
@@ -186,7 +208,6 @@ func (d *telnetClient) client(
 	b []byte,
 ) error {
 	remoteConn, remoteConnErr := d.getRemote()
-
 	if remoteConnErr != nil {
 		return remoteConnErr
 	}
@@ -195,16 +216,13 @@ func (d *telnetClient) client(
 	// to the server
 	for !r.Completed() {
 		rBuf, rErr := r.Buffered()
-
 		if rErr != nil {
 			return rErr
 		}
 
 		_, wErr := remoteConn.Write(rBuf)
-
 		if wErr != nil {
 			remoteConn.Close()
-
 			d.l.Debug("Failed to write data to remote: %s", wErr)
 		}
 	}
@@ -214,16 +232,16 @@ func (d *telnetClient) client(
 
 func (d *telnetClient) Close() error {
 	remoteConn, remoteConnErr := d.getRemote()
-
 	if remoteConnErr == nil {
 		remoteConn.Close()
 	}
 
+	d.baseCtxCancel()
 	d.closeWait.Wait()
-
 	return nil
 }
 
 func (d *telnetClient) Release() error {
+	d.baseCtxCancel()
 	return nil
 }
